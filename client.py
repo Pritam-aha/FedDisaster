@@ -72,7 +72,7 @@ def main():
     args = parser.parse_args()
 
     client = FlowerClient(cid=args.cid, batch_size=args.batch_size, lr=args.lr)
-    fl.client.start_numpy_client(server_address="127.0.0.1:8080", client=client)
+    fl.client.start_client(server_address="127.0.0.1:8080", client=client.to_client())
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import argparse
+import json
 import matplotlib.pyplot as plt
 import flwr as fl
 import torch
@@ -13,16 +14,28 @@ from utils import get_device, set_parameters_to_model, get_parameters_from_model
 round_accuracies = []  # Collected after each federated round on global test
 
 
+def _save_metrics(accuracies, out_path: str = "metrics.json"):
+    """Persist metrics for external UIs (e.g., Streamlit)."""
+    try:
+        with open(out_path, "w") as f:
+            json.dump({"accuracies": accuracies}, f)
+    except Exception as e:
+        print(f"[Server] Failed to write {out_path}: {e}")
+
+
 def get_evaluate_fn(model, test_loader, device):
     criterion = nn.CrossEntropyLoss()
 
-    def evaluate(server_round: int, parameters, config):
+    def evaluate(server_round, parameters, config):
         # Update model with the aggregated parameters
         if parameters is not None:
-            # Flower passes Parameters object; convert to ndarrays
-            # In recent flwr versions, parameters.tensors may already be bytes
-            # We can use flwr.common.parameters_to_ndarrays for safety
-            ndarrays = fl.common.parameters_to_ndarrays(parameters)
+            # Handle both old and new Flower parameter formats
+            if hasattr(parameters, 'tensors'):
+                # New Parameters object
+                ndarrays = fl.common.parameters_to_ndarrays(parameters)
+            else:
+                # Already a list of ndarrays
+                ndarrays = parameters
             set_parameters_to_model(model, ndarrays)
 
         loss, acc = 0.0, 0.0
@@ -32,6 +45,7 @@ def get_evaluate_fn(model, test_loader, device):
             loss, acc = dl.evaluate(model, test_loader, device, criterion=criterion)
 
         round_accuracies.append(acc)
+        _save_metrics(round_accuracies)
         print(f"[Server] Round {server_round}: global_test acc = {acc:.4f}")
         # Return a loss and a dictionary of metrics
         return float(loss), {"accuracy": float(acc)}
