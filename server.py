@@ -10,6 +10,15 @@ from dataset_loader import load_global_test_loader
 from models import SimpleCNN
 from utils import get_device, set_parameters_to_model, get_parameters_from_model
 
+class LocalHead(nn.Module):
+    def __init__(self, feature_dim, num_classes):
+        super().__init__()
+        self.fc = nn.Linear(feature_dim, num_classes)
+
+    def forward(self, x):
+        return self.fc(x)
+
+
 
 round_accuracies = []  # Collected after each federated round on global test
 
