@@ -4,6 +4,8 @@ import torch.nn as nn
 import torch.optim as optim
 import flwr as fl
 
+from typing import Optional
+
 from dataset_loader import load_imagefolder_dataloaders
 from models import EfficientNetB0Extractor, SimpleCNN, LocalHead
 from utils import get_device, get_parameters_from_model, set_parameters_to_model
@@ -30,18 +32,28 @@ def get_loaders_for_client(cid: int, batch_size: int, preset: str):
 
 
 class FlowerClient(fl.client.NumPyClient):
-    """
-    Federated client:
-    - Receives global CNN feature extractor
+    """Federated client.
+
+    - Receives global backbone feature extractor
     - Trains a LOCAL classification head
-    - Sends back ONLY the CNN parameters (FedAvg)
+    - Optionally fine-tunes the SHARED backbone (real FedAvg)
+    - Sends back ONLY the backbone parameters (FedAvg)
     """
 
-    def __init__(self, cid: int, batch_size: int = 32, lr: float = 1e-3, backbone: str = "simplecnn"):
+    def __init__(
+        self,
+        cid: int,
+        batch_size: int = 32,
+        lr: float = 1e-3,
+        backbone: str = "simplecnn",
+        train_backbone: bool = False,
+        backbone_lr: Optional[float] = None,
+    ):
         self.cid = cid
         self.batch_size = batch_size
         self.lr = lr
         self.backbone = backbone
+        self.train_backbone = bool(train_backbone)
         self.preset = _preset_for_backbone(backbone)
 
         # ---- Data ----
@@ -58,8 +70,29 @@ class FlowerClient(fl.client.NumPyClient):
 
         self.criterion = nn.CrossEntropyLoss()
 
-        # Optimizer: train only the local head by default (fast & stable)
-        self.optimizer = optim.Adam(self.local_head.parameters(), lr=self.lr)
+        # ---- Optimizer ----
+        # Always train local head; optionally train backbone.
+        head_params = list(self.local_head.parameters())
+        if not self.train_backbone:
+            # Freeze backbone explicitly
+            for p in self.model.parameters():
+                p.requires_grad = False
+            self.optimizer = optim.Adam(head_params, lr=self.lr)
+        else:
+            for p in self.model.parameters():
+                p.requires_grad = True
+
+            # Safer default LR for EfficientNet fine-tuning on CPU
+            if backbone_lr is None:
+                backbone_lr = 1e-4 if self.preset == "efficientnet_b0" else self.lr
+
+            backbone_params = [p for p in self.model.parameters() if p.requires_grad]
+            self.optimizer = optim.Adam(
+                [
+                    {"params": head_params, "lr": self.lr},
+                    {"params": backbone_params, "lr": float(backbone_lr)},
+                ]
+            )
 
     # Flower will call this to get current local weights (CNN ONLY)
     def get_parameters(self, config):
@@ -92,9 +125,12 @@ class FlowerClient(fl.client.NumPyClient):
 
                 self.optimizer.zero_grad()
 
-                # CNN feature extraction
-                with torch.no_grad():  # ✅ Freeze CNN
+                # Backbone feature extraction (optionally trainable)
+                if self.train_backbone:
                     features = self.model(images)
+                else:
+                    with torch.no_grad():
+                        features = self.model(images)
 
                 # Classification via local head
                 logits = self.local_head(features)
@@ -178,11 +214,20 @@ def main():
     parser.add_argument("--cid", type=int, required=True, help="Client ID, e.g., 1")
     parser.add_argument("--backbone", type=str, default="simplecnn", choices=["simplecnn", "efficientnet_b0"], help="Feature extractor backbone")
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate for local head (and SimpleCNN backbone if trainable)")
+    parser.add_argument("--train_backbone", action="store_true", help="Fine-tune the SHARED backbone (real FedAvg).")
+    parser.add_argument("--backbone_lr", type=float, default=None, help="Optional separate LR for backbone fine-tuning (default: 1e-4 for EfficientNet, else --lr)")
     parser.add_argument("--address", type=str, default="127.0.0.1:8080", help="gRPC server address")
     args = parser.parse_args()
 
-    client = FlowerClient(cid=args.cid, batch_size=args.batch_size, lr=args.lr, backbone=args.backbone)
+    client = FlowerClient(
+        cid=args.cid,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        backbone=args.backbone,
+        train_backbone=args.train_backbone,
+        backbone_lr=args.backbone_lr,
+    )
     fl.client.start_client(server_address=args.address, client=client.to_client())
 
 
