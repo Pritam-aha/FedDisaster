@@ -5,14 +5,28 @@ import torch.optim as optim
 import flwr as fl
 
 from dataset_loader import load_imagefolder_dataloaders
-from models import SimpleCNN, LocalHead
+from models import EfficientNetB0Extractor, SimpleCNN, LocalHead
 from utils import get_device, get_parameters_from_model, set_parameters_to_model
 
 
-def get_loaders_for_client(cid: int, batch_size: int):
+def _preset_for_backbone(backbone: str) -> str:
+    backbone = (backbone or "simplecnn").lower()
+    if backbone in {"efficientnet", "efficientnet_b0", "effnet_b0"}:
+        return "efficientnet_b0"
+    return "simplecnn"
+
+
+def _build_backbone(backbone: str) -> torch.nn.Module:
+    backbone = (backbone or "simplecnn").lower()
+    if backbone in {"efficientnet", "efficientnet_b0", "effnet_b0"}:
+        return EfficientNetB0Extractor(pretrained=True)
+    return SimpleCNN()
+
+
+def get_loaders_for_client(cid: int, batch_size: int, preset: str):
     train_dir = f"data/client_{cid}/train"
     test_dir = f"data/client_{cid}/test"
-    return load_imagefolder_dataloaders(train_dir, test_dir, batch_size=batch_size)
+    return load_imagefolder_dataloaders(train_dir, test_dir, batch_size=batch_size, preset=preset)
 
 
 class FlowerClient(fl.client.NumPyClient):
@@ -23,19 +37,21 @@ class FlowerClient(fl.client.NumPyClient):
     - Sends back ONLY the CNN parameters (FedAvg)
     """
 
-    def __init__(self, cid: int, batch_size: int = 32, lr: float = 1e-3):
+    def __init__(self, cid: int, batch_size: int = 32, lr: float = 1e-3, backbone: str = "simplecnn"):
         self.cid = cid
         self.batch_size = batch_size
         self.lr = lr
+        self.backbone = backbone
+        self.preset = _preset_for_backbone(backbone)
 
         # ---- Data ----
-        self.train_loader, self.test_loader, self.num_classes = get_loaders_for_client(cid, batch_size)
+        self.train_loader, self.test_loader, self.num_classes = get_loaders_for_client(cid, batch_size, preset=self.preset)
 
         # ---- Device ----
         self.device = get_device()
 
         # ---- Global Federated Model (Feature Extractor) ----
-        self.model = SimpleCNN().to(self.device)
+        self.model = _build_backbone(backbone).to(self.device)
 
         # ---- Local Head (NOT SHARED) ----
         self.local_head = LocalHead(self.model.feature_dim, self.num_classes).to(self.device)
@@ -62,7 +78,7 @@ class FlowerClient(fl.client.NumPyClient):
         batch_size = int(config.get("batch_size", self.batch_size))
 
         if batch_size != self.batch_size:
-            self.train_loader, self.test_loader, _ = get_loaders_for_client(self.cid, batch_size)
+            self.train_loader, self.test_loader, _ = get_loaders_for_client(self.cid, batch_size, preset=self.preset)
             self.batch_size = batch_size
 
         # ---- Local Training (CNN frozen, Head trained) ----
@@ -160,12 +176,14 @@ class FlowerClient(fl.client.NumPyClient):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cid", type=int, required=True, help="Client ID, e.g., 1")
+    parser.add_argument("--backbone", type=str, default="simplecnn", choices=["simplecnn", "efficientnet_b0"], help="Feature extractor backbone")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--address", type=str, default="127.0.0.1:8080", help="gRPC server address")
     args = parser.parse_args()
 
-    client = FlowerClient(cid=args.cid, batch_size=args.batch_size, lr=args.lr)
-    fl.client.start_client(server_address="127.0.0.1:8080", client=client.to_client())
+    client = FlowerClient(cid=args.cid, batch_size=args.batch_size, lr=args.lr, backbone=args.backbone)
+    fl.client.start_client(server_address=args.address, client=client.to_client())
 
 
 if __name__ == "__main__":
